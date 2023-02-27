@@ -1,0 +1,162 @@
+params.runid = 'test'
+params.directory = "s3://vaxart-batch-output/RNA/${params.runid}/${params.folder}"
+
+process guppy {
+
+  label 'guppy'
+
+  tag "_${params.runid}"
+
+  input:
+  path input from "${params.basedir}"
+
+  output:
+  path "${input}/**.fast5*" into guppy_ch
+  file("dmux/${params.runid}.fastq") into dmux_ch
+
+  script:
+  """
+  mkdir -p guppy
+  mkdir -p dmux
+  guppy_basecaller -i ${input} -s guppy -c rna_r9.4.1_70bps_hac.cfg -x "cuda:0"
+  cat guppy/pass/*.fastq > dmux/${params.runid}.fastq
+  /home/ec2-user/miniconda/bin/aws s3 sync guppy/ s3://vaxart-batch-output/RNA/${params.runid}/guppy/
+  /home/ec2-user/miniconda/bin/aws s3 sync fast5/ s3://vaxart-batch-output/RNA/${params.runid}/fast5/
+  /home/ec2-user/miniconda/bin/aws s3 sync dmux/ s3://vaxart-batch-output/RNA/${params.runid}/dmux/
+  """
+
+}
+
+
+process minimap {
+
+  errorStrategy 'ignore'
+
+  publishDir params.directory, mode:'copy'
+
+  label 'nanopanel2'
+
+  tag "_${params.folder}_${params.runid}"
+
+  input:
+  path fastq from "${params.directory}/fastq"
+  path genome from "${params.directory}/reference"
+
+  output:
+  tuple path("minimap"), path(genome) into minimap_ch
+  tuple path("minimap") into minimap_ch2
+
+  script:
+  """
+  mkdir -p minimap
+  dos2unix ${genome}/reference.fa
+  dos2unix ${genome}/transcriptome.fa
+  minimap2 --sam-hit-only --MD -ax splice -uf -k14 --eqx ${genome}/reference.fa ${fastq}/${params.runid}.fastq -o minimap/${params.runid}.bam
+  minimap2 -t 4 -ax map-ont -p 0 -N 10 --MD --eqx ${genome}/transcriptome.fa ${fastq}/${params.runid}.fastq -o minimap/${params.runid}_transcriptome.bam
+  """
+
+}
+
+process samtools {
+
+  errorStrategy 'ignore'
+
+  publishDir params.directory, mode:'copy'
+
+  label 'nanopanel2'
+
+  tag "_${params.folder}_${params.runid}"
+
+  input:
+  tuple path(folder), path(genome) from minimap_ch
+
+  output:
+  tuple path("samtools"), path(genome) into samtools_ch
+
+  script:
+  """
+  mkdir -p samtools
+  samtools sort ${folder}/${params.runid}.bam -o samtools/${params.runid}_sorted.bam
+  samtools index samtools/${params.runid}_sorted.bam samtools/${params.runid}_sorted.bam.bai
+  samtools stats ${folder}/${params.runid}.bam | grep ^SN | cat > samtools/${params.runid}_stats.text
+  samtools faidx ${genome}/reference.fa
+  """
+  
+}
+
+process jwr_checker {
+
+  errorStrategy 'ignore'
+
+  publishDir params.directory, mode:'copy'
+
+  label 'nanosplicer'
+
+  tag "_${params.folder}_${params.runid}"
+
+  input:
+  tuple path(folder), path(genome) from samtools_ch
+
+  output:
+  tuple path("samtools"), path("nano_splicer"), path(genome) into jwr_checker_ch
+
+  script:
+  """
+  mkdir -p nano_splicer
+  conda run -n NanoSplicer --live-stream python3 /app/NanoSplicer/bin/JWR_checker.py --output_csv ${folder}/${params.runid}_sorted.bam nano_splicer/${params.runid}.h5
+  """
+  
+}
+
+process splicer {
+
+  errorStrategy 'ignore'
+  
+  time '8h'
+
+  publishDir params.directory, mode:'copy'
+
+  label 'nanosplicer'
+
+  tag "_${params.folder}_${params.runid}"
+
+  input:
+  tuple path(samtools), path(nano_splicer), path(genome) from jwr_checker_ch
+  path fast5_pass from "s3://vaxart-batch-output/RNA/${params.runid}/fast5/"
+
+  output:
+  tuple path(samtools), path(nano_splicer), path(genome) into splicer_ch
+
+  script:
+  """
+  conda run -n NanoSplicer --live-stream python3 /app/NanoSplicer/bin/NanoSplicer.py -i ${samtools}/${params.runid}_sorted.bam -f ${fast5_pass} -r ${genome}/reference.fa -o ${nano_splicer}/${params.runid} ${nano_splicer}/${params.runid}.h5
+  cd ${nano_splicer}
+  conda run -n NanoSplicer --live-stream python3 /app/splice.py ${nano_splicer}/${params.runid}.h5.csv
+  """
+  
+}
+
+process nanocount {
+
+  errorStrategy 'ignore'
+
+  publishDir params.directory, mode:'copy'
+
+  label 'nanocount'
+
+  tag "_${params.folder}_${params.runid}"
+
+  input:
+  path folder from minimap_ch2
+
+  output:
+  path("nanocount") into nanocount_ch
+
+  script:
+  """
+  mkdir -p nanocount
+  NanoCount -i ${folder}/${params.runid}_transcriptome.bam -o nanocount/${params.runid}_transcript_counts.tsv
+  """
+  
+ }
+
